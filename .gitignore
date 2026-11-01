@@ -1,0 +1,16 @@
+# Build output: never committed (reproducible from this source; the .elemod is
+# attached to the tag's release)
+release/
+out/
+*.elemod
+
+# Stock firmware and anything derived from it - never commit (Elektron copyright)
+*.syx
+*.bin
+*.elf
+*.o
+
+# Local
+__pycache__/
+*.log
+.DS_Store

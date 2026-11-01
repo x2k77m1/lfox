@@ -1,0 +1,26 @@
+{
+ "id": "lfox", "version": "1.0a",
+ "license": "GPL-2.0-or-later",
+ "title": "LFOX (Digitone mk1)",
+ "category": "Modulation", "author": "x2k",
+ "description": "A third LFO on the Digitone mk1: the LFO key cycles LFO1, LFO2, LFOX. LFOX has the stock LFO page's eight controls -- SPD, MULT, FADE, DEST, WAVE, SPH, MODE and DEP -- on its own page, computed by the firmware's own LFO engine: the stock routine at 0x400FED62 runs a second time each block with LFOX's settings and state, so its rate, waveforms, fade and trigger modes are the stock ones, per voice. All eight settings are saved with the sound, and DEST opens the stock destination list, as on LFO1 and LFO2. Needs core-dn1 4.0.",
+ "device": "digitone-mk1", "os": "1.44",
+ "sources": ["lfox.c"],
+ "sites": [
+  {"addr": "0x4009dd02", "stock": "4eb9400fed62", "op": "jsr", "target": "lfox_audio"}
+ ],
+ "contribute": [
+  {"to": "core_pages", "order": 50, "data": "00000000",
+   "relocs": [[0, "abs32", "sym:lfox_page", 0]]}
+ ],
+ "subscribe": [
+  {"event": "ev_tick", "fn": "lfox_tick", "order": 50},
+  {"event": "ev_key", "fn": "lfox_key", "order": 50},
+  {"event": "ev_draw", "fn": "lfox_draw", "order": 60}
+ ],
+ "resources": {
+  "core": "4.0",
+  "names": ["page:27", "soundslot:0", "soundslot:26", "soundslot:65"]
+ },
+ "requires": ["core"]
+}
