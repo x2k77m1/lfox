@@ -16,9 +16,9 @@ Unofficial, not affiliated with Elektron. Ships no firmware.
 ## Install
 
 You need the stock **Digitone mk1 OS 1.44** `.syx`, **core-dn1 4.0** and
-**lfox-1.0a.elemod**.
+**lfox-1.0b.elemod**.
 
-In elekloader, add `core-4.0-os1.44.elemod` and `lfox-1.0a.elemod` to the
+In elekloader, add `core-4.0-os1.44.elemod` and `lfox-1.0b.elemod` to the
 build, patch the stock OS file and send the result with Elektron Transfer.
 With the command line:
 
@@ -26,8 +26,8 @@ With the command line:
 python -m elekloader.patch \
     --stock Digitone_and_Digitone_Keys_OS1.44.syx \
     --mod core-4.0-os1.44.elemod \
-    --mod lfox-1.0a.elemod \
-    --out Digitone_OS1.44_LFOX.syx --version 1.0a
+    --mod lfox-1.0b.elemod \
+    --out Digitone_OS1.44_LFOX.syx --version 1.0b
 ```
 
 The version must be exactly four characters. The mod targets **OS 1.44 only**:
@@ -59,17 +59,21 @@ the default exactly as on LFO1's and LFO2's pages. **DEST** opens the stock
 destination list (filter, amp and synth parameters), and its name is always the
 parameter that is actually modulated.
 
+LFOX also modulates the parameters a machine mod reads itself — machines-dn1's
+knobs, SAY IT's PIT, SPD, THRT and MOUT — as well as the stock ones.
+
 The waveform display between the **WAVE** and **SPH** boxes is drawn by the mod
 — the stock view binds that one to LFO1's and LFO2's records — with the stock
 page's own artwork, and `SPH` rotates the curve the way stock does.
 
 ## Settings
 
-All eight settings live in the track's sound, in three sound slots no stock
-parameter uses (0, 26 and 65), packed into 48 bits. They are saved and loaded
-with the sound, the kit and the project, with **no format change**: a sound
-without the marker reads the stock LFO1 defaults. The per-voice LFO state is
-RAM and is not saved.
+All eight settings live in the **project**, in one project data block, eight
+bytes a track, with no format change: they are saved and loaded with the
+project, and a project without the block reads the stock LFO1 defaults. They are
+not in the sound or the kit — the only sound slots no stock parameter uses are 0,
+26 and 65, and machines and digitables keep those, so a mod that stored there
+could not be built beside them. The per-voice LFO state is RAM and is not saved.
 
 ## Build
 

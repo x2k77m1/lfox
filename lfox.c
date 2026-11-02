@@ -63,23 +63,23 @@
  * list, the same modal LFO1's and LFO2's pages show, and the slot that list
  * confirms is turned back into this mod's list entry by lfox_adopt.
  *
- * SETTINGS live in the track's sound, in the three free sound slots 0, 26 and
- * 65 (no stock parameter uses them), packed into 46 bits plus a 16-bit format
- * marker, and stay in RAM (lfox_ram) for the engine, which reads them per
- * voice at interrupt level.  They are saved and loaded with the sound, the
- * kit and the project, and a sound with no marker reads the defaults -- which
- * are LFO1's own (fw_params ids 49-56: SPD 0x6000, MULT 5, FADE 0x4000,
- * DEST 0, WAVE 0, SPH 0, MODE 0, DEP 0x4000).  Every field keeps the value
- * the stock UI shows as a whole number; a field's low byte is unused by the
- * stock parameters too (SPD and DEP reach 0x7FFE, i.e. x.99, but the knob
- * steps them whole), so what a page shows and what the engine runs agree.
+ * SETTINGS are kept with the project: one core-dn1 project data block
+ * ("Project data"), eight whole-number bytes a track, saved in the gap of the
+ * project's storage block and loaded again with it, and held in RAM (lfox_ram)
+ * for the engine, which reads them per voice at interrupt level.  They are not
+ * the sound's any more, and that is on purpose: the only sound slots no stock
+ * parameter uses are 0, 26 and 65, and machines keeps slot 0 while digitables
+ * keeps 26 and 65 (the linker's `soundslot` claims), so a mod that stored in
+ * them could not be built beside either.  LFOX stores in none.
+ *
+ * A project with no block reads the defaults, which are LFO1's own (fw_params
+ * ids 49-56: SPD 0x6000, MULT 5, FADE 0x4000, DEST 0, WAVE 0, SPH 0, MODE 0,
+ * DEP 0x4000).  Every field keeps the value the stock UI shows as a whole
+ * number, so what the page shows and what the engine runs agree.
  */
 #include "digitone-mk1/core3.h"
 
 #define LFOX_VOICES     8
-#define LFOX_SLOT_A     0               /* the three free sound slots */
-#define LFOX_SLOT_B     26
-#define LFOX_SLOT_C     65
 #define LFOX_DEP_ZERO   0x4000          /* the depth word's zero (and SPD's) */
 #define LFOX_BLOCK_L2   9               /* the second LFO's value block: 9-16 */
 #define LFOX_L1_DEP     8               /* LFO1's own depth: value 8 */
@@ -109,8 +109,8 @@ struct lfox_target {
 
 /* LFO1 and LFO2 first, then the filter, amp and synth values a stock LFO can
  * reach (the destination is a value index 0-78; these are the stock list's
- * entries, each mapped to the value it modulates).  Values 0, 26 and 65 are
- * LFOX's own storage and are absent. */
+ * entries, each mapped to the value it modulates).  Values 0, 26 and 65 hold no
+ * stock parameter and are absent: nothing reads them. */
 static const struct lfox_target lfox_targets[] = {
     { -1, "",    "---" },
     {  1, "L1",  "SPD" }, {  2, "L1",  "MULT" }, {  3, "L1",  "FADE" }, {  4, "L1",  "DEST" },
@@ -152,62 +152,6 @@ static void lfox_defaults(struct lfox_state *s)
 
     for (i = 0; i < C_COUNT; i++)
         s->v[i] = lfox_default[i];
-}
-
-/* ---- the packed sound state --------------------------------------------------------------- */
-
-/* 46 bits into the three free words as one 48-bit field, with a two-bit
- * marker on top:
- *
- *   SPD 7 | MULT 5 | FADE 7 | DEST 7 | WAVE 3 | SPH 7 | MODE 3 | DEP 7 | 3 3
- *   bits 0-6  7-11   12-18   19-25    26-28   29-35   36-38    39-45   46-47
- *
- * A stock sound has zeros at slots 0, 26 and 65 (no parameter descriptor
- * claims them, so nothing ever writes them): without the marker a sound reads
- * the defaults, so a stock sound and a sound that carries LFOX are told
- * apart.  The order is the engine's own block order, and every field keeps
- * the whole-number value the stock UI shows. */
-#define LFOX_MARKER  3u
-
-static uint16_t lfox_pack(const struct lfox_state *s, int32_t word)
-{
-    uint64_t v = (uint64_t)(s->v[C_SPD] & 0x7F)
-               | ((uint64_t)(s->v[C_MULT] & 0x1F) << 7)
-               | ((uint64_t)(s->v[C_FADE] & 0x7F) << 12)
-               | ((uint64_t)(s->v[C_DEST] & 0x7F) << 19)
-               | ((uint64_t)(s->v[C_WAVE] & 0x07) << 26)
-               | ((uint64_t)(s->v[C_SPH] & 0x7F) << 29)
-               | ((uint64_t)(s->v[C_MODE] & 0x07) << 36)
-               | ((uint64_t)(s->v[C_DEP] & 0x7F) << 39)
-               | ((uint64_t)LFOX_MARKER << 46);
-
-    if (word == 0)
-        return (uint16_t)v;
-    if (word == 1)
-        return (uint16_t)(v >> 16);
-    return (uint16_t)(v >> 32);
-}
-
-static void lfox_unpack(uint16_t w0, uint16_t w1, uint16_t w2, struct lfox_state *s)
-{
-    uint64_t v = (uint64_t)w0 | ((uint64_t)w1 << 16) | ((uint64_t)w2 << 32);
-    int32_t i;
-
-    if ((v >> 46) != LFOX_MARKER) {
-        lfox_defaults(s);
-        return;
-    }
-    s->v[C_SPD]  = (uint8_t)(v & 0x7F);
-    s->v[C_MULT] = (uint8_t)((v >> 7) & 0x1F);
-    s->v[C_FADE] = (uint8_t)((v >> 12) & 0x7F);
-    s->v[C_DEST] = (uint8_t)((v >> 19) & 0x7F);
-    s->v[C_WAVE] = (uint8_t)((v >> 26) & 0x07);
-    s->v[C_SPH]  = (uint8_t)((v >> 29) & 0x7F);
-    s->v[C_MODE] = (uint8_t)((v >> 36) & 0x07);
-    s->v[C_DEP]  = (uint8_t)((v >> 39) & 0x7F);
-    for (i = 0; i < C_COUNT; i++)
-        if (s->v[i] > lfox_max[i])
-            s->v[i] = lfox_max[i];
 }
 
 /* ---- the settings the engine reads, and where they come from ------------------------------ */
@@ -298,49 +242,80 @@ static void lfox_ram_get(int32_t track, struct lfox_state *s)
 /* Defined with the page's state, below. */
 static void lfox_forget_lend(int32_t track);
 
-/* Read the track's packed state out of its sound (the sound may just have been
- * loaded, with the kit, the sound or the project). */
-void lfox_reload(int32_t track)
-{
-    struct lfox_state s;
+/* ---- the project data block: where the settings are saved --------------------------------- */
 
-    if (!fw_kit || track < 0 || track > 3)
-        return;
-    lfox_unpack((uint16_t)FW_SOUND_SLOT(fw_kit, track, LFOX_SLOT_A),
-                (uint16_t)FW_SOUND_SLOT(fw_kit, track, LFOX_SLOT_B),
-                (uint16_t)FW_SOUND_SLOT(fw_kit, track, LFOX_SLOT_C), &s);
-    lfox_ram_set(track, &s);
-    lfox_dirty = 1;
-    /* The record may just have been replaced (a sound, a kit, a project): what
-     * the page lent into its LFO1 slots is gone with it, so the next lend keeps
-     * LFO1's words from the new sound instead of handing back the old sound's. */
-    lfox_forget_lend(track);
-}
+/* Eight whole numbers a track, one byte each.  They go in one core-dn1 project
+ * data block (a struct core_projdata, its own 32 bytes in the 480-byte gap of
+ * the project's storage block), which core fills and reads at every project
+ * load and save.  See the top of this file for why they are not sound slots. */
+#define LFOX_TAG        0x4C464F33u     /* 'LFOX' */
+#define LFOX_STORE_SIZE (4 * C_COUNT)
 
-/* The three packed words from what RAM holds: the sound's copy of the
- * settings, without touching the engine (which may hold a value the stock knob
- * has stepped more finely than a whole number). */
-static void lfox_pack_store(int32_t track)
+static uint8_t lfox_saved[LFOX_STORE_SIZE] __attribute__((aligned(4))) = {
+    96, 5, 64, 0, 0, 0, 0, 64,     /* the defaults, a track each: a project */
+    96, 5, 64, 0, 0, 0, 0, 64,     /* that saved no block reads these in  */
+    96, 5, 64, 0, 0, 0, 0, 64,     /* lfox_loaded's place                  */
+    96, 5, 64, 0, 0, 0, 0, 64
+};
+
+/* The settings RAM holds into the block (what a save copies). */
+static void lfox_block_put(int32_t track)
 {
     struct lfox_state c;
+    int32_t i;
 
-    if (!fw_kit || track < 0 || track > 3)
+    if (track < 0 || track > 3)
         return;
     lfox_ram_get(track, &c);
-    FW_SOUND_SLOT(fw_kit, track, LFOX_SLOT_A) = (int16_t)lfox_pack(&c, 0);
-    FW_SOUND_SLOT(fw_kit, track, LFOX_SLOT_B) = (int16_t)lfox_pack(&c, 1);
-    FW_SOUND_SLOT(fw_kit, track, LFOX_SLOT_C) = (int16_t)lfox_pack(&c, 2);
+    for (i = 0; i < C_COUNT; i++)
+        lfox_saved[track * C_COUNT + i] = c.v[i];
 }
 
-/* Write it back to the sound, as a stock edit would.  The words are packed
- * from the RAM copy, so what the sound records is exactly what the engine
- * runs. */
-void lfox_store(int32_t track, const struct lfox_state *s)
+/* The block -> the settings the engine reads, every track. */
+static void lfox_block_load(void)
 {
-    if (!fw_kit || track < 0 || track > 3)
-        return;
-    lfox_ram_set(track, s);
-    lfox_pack_store(track);
+    struct lfox_state s;
+    int32_t t, i;
+
+    for (t = 0; t < 4; t++) {
+        for (i = 0; i < C_COUNT; i++)
+            s.v[i] = lfox_saved[t * C_COUNT + i];
+        lfox_ram_set(t, &s);
+    }
+    lfox_dirty = 1;                     /* the page re-lends from the new values */
+}
+
+/* core calls this after a project load, and for a new project, with the block's
+ * bytes already in lfox_saved; `found` is 0 when the project has none (a new
+ * project, one saved without LFOX, or a block of another size) and the bytes are
+ * zeros, which would be a silent LFOX -- so the defaults go in their place. */
+static void lfox_loaded(int32_t found)
+{
+    struct lfox_state s;
+    int32_t t, i;
+
+    if (!found) {
+        lfox_defaults(&s);
+        for (t = 0; t < 4; t++)
+            for (i = 0; i < C_COUNT; i++)
+                lfox_saved[t * C_COUNT + i] = s.v[i];
+    }
+    lfox_block_load();
+    /* The kit the page lent LFO1's slots from may be gone with the project. */
+    for (t = 0; t < 4; t++)
+        lfox_forget_lend(t);
+}
+
+const struct core_projdata lfox_store = {
+    LFOX_TAG, LFOX_STORE_SIZE, lfox_saved, lfox_loaded
+};
+
+/* A track's settings changed: RAM and the block, without touching the engine
+ * (which may hold a value the stock knob has stepped more finely than a whole
+ * number).  The block is stamped into the project the next time it is saved. */
+static void lfox_save(int32_t track)
+{
+    lfox_block_put(track);
     lfox_dirty = 1;
 }
 
@@ -379,6 +354,61 @@ static int16_t lfox_save_dep[LFOX_VOICES];
 static int32_t lfox_save_st[LFOX_VOICES][20];   /* both LFOs' state, this block */
 static const int16_t lfox_silent[C_COUNT] = LFOX_ENG_DEFAULTS;   /* no depth: nothing */
 
+/* LFOX's modulation in the voice's own parameter word.  The pass writes it into
+ * the block's parameter words (`words`), which is where LFO1's and LFO2's
+ * modulation goes too, and that is what the render reads for a stock parameter.
+ * A machine mod's knob is not read from there: machines-dn1's dnm_knob returns
+ * FW_VOICE_PARAM(voice, slot), the word the render starts the block from, and a
+ * machine reads its knobs itself (the two stock LFOs reach a machine parameter
+ * only because the machine adds their records -- `FW_LFO_DEST`/`FW_LFO_MOD` --
+ * to its knobs, and there is no third record it would look for).  So LFOX puts
+ * its modulation in the word as well, and takes the pass's own write back out
+ * of the block, so a parameter is modulated once whichever reads it. */
+static int16_t lfox_pre[LFOX_VOICES];    /* the destination word before the pass */
+static int16_t lfox_add[LFOX_VOICES];    /* what LFOX has added to the word */
+static int16_t lfox_after[LFOX_VOICES];  /* the word as LFOX left it */
+static int16_t lfox_slot[LFOX_VOICES];   /* the slot it was added to */
+
+static void lfox_word_release(int32_t v)
+{
+    volatile int16_t *p;
+
+    if (!lfox_add[v])
+        return;
+    p = &FW_VOICE_PARAM(v, lfox_slot[v]);
+    /* Only what is still there is taken out: a knob, a p-lock or a sound load
+     * since the last block has written the word, and that value is the base. */
+    if (*p == lfox_after[v])
+        *p = (int16_t)(*p - lfox_add[v]);
+    lfox_add[v] = 0;
+}
+
+/* slot < 0: no destination, so nothing of LFOX stays in any word. */
+static void lfox_word(int32_t v, int32_t slot, int32_t mod)
+{
+    volatile int16_t *p;
+    int32_t cur, base, out;
+
+    if (slot < 0 || slot > 78) {
+        lfox_word_release(v);
+        return;
+    }
+    if (lfox_add[v] && lfox_slot[v] != slot)
+        lfox_word_release(v);
+    p = &FW_VOICE_PARAM(v, slot);
+    cur = *p;
+    base = (lfox_add[v] && cur == lfox_after[v]) ? cur - lfox_add[v] : cur;
+    out = base + mod;
+    if (out > 32767)
+        out = 32767;
+    else if (out < -32768)
+        out = -32768;
+    *p = (int16_t)out;
+    lfox_add[v] = (int16_t)(out - base);
+    lfox_after[v] = (int16_t)out;
+    lfox_slot[v] = (int16_t)slot;
+}
+
 /* The `jsr 0x400FED62` at 0x4009DD02 now reaches this: the same six arguments,
  * the same registers (d2-d7/a2-a6 are the compiler's to keep), and the stock
  * routine's own call, so nothing about its contract changes. */
@@ -393,10 +423,16 @@ void lfox_audio(int16_t *words, uint32_t rate, uint32_t mask, uint32_t mask2,
     lfox_lent_words(words);         /* LFO1's own settings, while the page lends */
     lfox_tick_impl(words, rate, mask, mask2, arg4, arg5);   /* LFO1 and LFO2, stock */
 
-    if (!lfox_live)
+    if (!lfox_live) {
+        for (v = 0; v < LFOX_VOICES; v++)
+            lfox_word_release(v);
         return;
+    }
 
     if (arg4 != 0xFFFFFFFFu || arg5 != 0xFFFFFFFFu) {
+        /* No LFOX this block: the words keep nothing of the last one. */
+        for (v = 0; v < LFOX_VOICES; v++)
+            lfox_word_release(v);
         /* The reset call: the routine puts its pristine state back over the
          * live records, so this block computes no LFOX -- the next one will,
          * from the carried state.  LFOX's own state is left alone here: the
@@ -430,6 +466,8 @@ void lfox_audio(int16_t *words, uint32_t rate, uint32_t mask, uint32_t mask2,
         volatile int16_t *w = val + 79 * v;
 
         track = fw_voice_track[v];
+        dest = (track >= 0 && track <= 3) ? lfox_dest_value(track) : -1;
+        lfox_pre[v] = (dest >= 0 && dest <= 78) ? w[9 + dest] : 0;
         set = (track >= 0 && track <= 3) ? lfox_eng[track] : lfox_silent;
         for (i = 0; i < 8; i++)
             w[9 + LFOX_BLOCK_L2 + i] = set[i];
@@ -442,14 +480,25 @@ void lfox_audio(int16_t *words, uint32_t rate, uint32_t mask, uint32_t mask2,
     lfox_tick_impl(words, rate, mask, mask2, arg4, arg5);
 
     /* 4. LFOX's advanced state is kept and everything else handed back.  The
-     *    value LFOX aimed at is left as the pass wrote it: a destination
-     *    inside the borrowed block, or LFO1's depth, means LFOX modulating
-     *    that LFO's own settings for this block. */
+     *    destination's word goes back to what the first pass left, and the
+     *    modulation it gained goes into the voice's own parameter word, where a
+     *    machine mod's dnm_knob and the render's next block both read it.  A
+     *    destination inside the borrowed block or at LFO1's depth means LFOX
+     *    modulating that LFO's own settings for this block: the word is the
+     *    same one either way. */
     for (v = 0; v < LFOX_VOICES; v++) {
         volatile int16_t *w = val + 79 * v;
+        int32_t mod = 0;
 
         track = fw_voice_track[v];
         dest = (track >= 0 && track <= 3) ? lfox_dest_value(track) : -1;
+        /* What the pass added for LFOX, and the block's word as it was before
+         * it: the modulation is carried to the voice's own word instead, so the
+         * parameter is not modulated twice and a machine knob sees it. */
+        if (dest >= 0 && dest <= 78) {
+            mod = w[9 + dest] - lfox_pre[v];
+            w[9 + dest] = lfox_pre[v];
+        }
         for (i = 0; i < 10; i++)
             lfox_st[v][i] = st[20 * v + LFOX_ST_PASS + i];
         for (i = 0; i < 20; i++)
@@ -459,6 +508,7 @@ void lfox_audio(int16_t *words, uint32_t rate, uint32_t mask, uint32_t mask2,
                 w[9 + LFOX_BLOCK_L2 + i] = lfox_save_cfg[v][i];
         if (LFOX_L1_DEP != dest)
             w[9 + LFOX_L1_DEP] = lfox_save_dep[v];
+        lfox_word(v, dest, mod);
     }
 }/* A note-on does NOT reset LFOX from here.  It used to, for every mode but the
  * one this file guessed was free-run, and that guess is the bug the unit
@@ -566,7 +616,8 @@ static void lfox_lend(int32_t track)
  * on the next tick -- but the audio blocks in between would then run LFO1 on
  * LFOX's settings, which is a track's pitch following LFOX's destination.
  *
- * AND after the page has gone.  Measured: the sound is LFO1's own again the moment the page is left, while a voice that
+ * AND after the page has gone.  Measured:
+ * the sound is LFO1's own again the moment the page is left, while a voice that
  * played during the visit still carries LFOX's SPD and DEP with LFO1's own DEST
  * -- and the render puts those values back every block, so the voice keeps
  * modulating its destination at LFOX's rate and depth until LFOX's page is
@@ -619,7 +670,8 @@ static void lfox_put_back(int32_t track)
 
     if (!fw_kit || track < 0 || track > 3)
         return;
-    /* core_sound_set, not a write to the kit: measured, the render puts the sound's values back into a voice every block from the
+    /* core_sound_set, not a write to the kit: measured,
+     * the render puts the sound's values back into a voice every block from the
      * copy a stock edit leaves with it, so a kit write alone is overwritten in
      * the voices on the next block -- which is the unit's "leave LFOX's page and
      * LFO1 modulates at LFOX's rate and depth".  core_sound_set is the stock
@@ -730,8 +782,9 @@ static void lfox_bracket(void *bmp, int32_t x, int32_t open)
  * and the phase square.  Nothing else is drawn between the brackets, so the
  * clear takes the whole interior.
  *
- * Two things here are stock's and were measured off stock's own pages: the
- * curve is the period that starts at `SPH` -- the shape is
+ * Two things here are stock's and were measured off it
+ * ("Stock LFO1's and LFO2's
+ * strips"): the curve is the period that starts at `SPH` -- the shape is
  * rotated, not merely marked -- and the hollow square is drawn only where that
  * start sample sits on the mid line, which is why stock shows it for TRI, SIN,
  * EXP and RMP at phase 0 and not for SQR, SAW or RND, nor at half a period. */
@@ -800,17 +853,17 @@ static void lfox_strip(void *bmp, int32_t wave, int32_t phase, int32_t right)
  * the bottom of that stack -- the one whose +4 points at itself minus 0x10
  * (the stack's header sits there).  Measured on the unit's build for the
  * destination list on both stock's LFO page and the mod's (00x41c185a0 plain,
- * below 0x41c18590; a list open, a new top whose below is 0x41c185a0), read on
- * a running unit.  Anything that cannot be read as that stack -- a
+ * below 0x41c18590; a list open, a new top whose below is 0x41c185a0), see
+ * Anything that cannot be read as that stack -- a
  * field this OS does not keep, memory that is not RAM -- is taken as "nothing
  * over the page": the strip is then drawn as before, and a field this code
  * reads wrong can only cost the fix, never the page.
  *
  * This is *not* the same question as "may the strip be drawn": stock draws
  * the strip as part of the page and the overlays land on it, so both the
- * destination list and FUNC's hints leave it visible (measured on stock's page:
- * with FUNC held and with the list open the
- * strip's own pixels are unchanged).  The mod draws after all of them, so it
+ * destination list and FUNC's hints leave it visible (measured on stock's
+ * page: with FUNC held and with the list open the strip's own pixels are
+ * unchanged).  The mod draws after all of them, so it
  * takes the columns that are free instead: the list's own text starts at
  * column 52, and FUNC's hints stay out of the strip's box altogether. */
 static int32_t lfox_covered(void)
@@ -870,7 +923,7 @@ void lfox_draw(void *bmp, void *ctrl)
  * choice just made -- losing it, and giving LFO1 LFOX's destination for as
  * long.  So the lend and the adopt follow core_page_shown's own checks -- the
  * page manager's view, and the page's place in that view's list -- without the
- * one for a screen on top (core-dn1's own pages). */
+ * one for a screen on top (core-dn1's mods/core-dn1/pages.s). */
 static int32_t lfox_page_up(void *brain)
 {
     void *screen, *mgr, *view;
@@ -947,7 +1000,7 @@ static int32_t lfox_adopt(int32_t t)
     slot = lfox_dest_value(t);
     lfox_eng[t][C_DEST] = (int16_t)((slot < 0) ? 0xFF00 : (slot << 8));
     lfox_live_update();
-    lfox_pack_store(t);
+    lfox_save(t);
     return 1;
 }
 
@@ -958,13 +1011,13 @@ void lfox_tick(void *ctrl)
     (void)ctrl;
     if (!lfox_brain)
         return;
-    /* The settings live in the track's sound, which the kit, a sound load or a
-     * project load can change under us: read them again when that may have
-     * happened.  Nothing else writes them, so this is once a kit or a track
-     * change, not every tick. */
+    /* The settings follow the project, not the sound: only the lend needs the
+     * kit, and a kit, sound or project load takes that sound's LFO1 words with
+     * it, so the lend is forgotten for the sound that is there now. */
     if (fw_kit != lfox_kit_seen || fw_active_track != lfox_track_seen) {
         for (t = 0; t < 4; t++)
-            lfox_reload(t);
+            lfox_forget_lend(t);
+        lfox_dirty = 1;
         lfox_kit_seen = fw_kit;
         lfox_track_seen = fw_active_track;
     }
