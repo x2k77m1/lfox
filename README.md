@@ -68,12 +68,11 @@ page's own artwork, and `SPH` rotates the curve the way stock does.
 
 ## Settings
 
-All eight settings live in the **project**, in one project data block, eight
-bytes a track, with no format change: they are saved and loaded with the
-project, and a project without the block reads the stock LFO1 defaults. They are
-not in the sound or the kit — the only sound slots no stock parameter uses are 0,
-26 and 65, and machines and digitables keep those, so a mod that stored there
-could not be built beside them. The per-voice LFO state is RAM and is not saved.
+The eight settings are saved with your **project**. A pattern carries them as
+part of the project it belongs to.
+
+LFOX is not part of a sound. Its settings follow the track, so loading a
+different sound onto that track leaves LFOX as it was.
 
 ## Build
 
