@@ -163,6 +163,7 @@ static void lfox_defaults(struct lfox_state *s)
  * whatever zero happens to mean in a value word. */
 #define LFOX_DEFAULTS { 96, 5, 64, 0, 0, 0, 0, 64 }
 #define LFOX_ENG_DEFAULTS { 0x6000, 0x0500, 0x4000, 0, 0, 0, 0, 0x4000 }
+#define LFOX_BASELINE_INIT { LFOX_DEFAULTS, LFOX_DEFAULTS, LFOX_DEFAULTS, LFOX_DEFAULTS }
 
 volatile uint8_t lfox_ram[4][C_COUNT] = {
     LFOX_DEFAULTS, LFOX_DEFAULTS, LFOX_DEFAULTS, LFOX_DEFAULTS
@@ -172,6 +173,7 @@ static volatile int16_t lfox_eng[4][C_COUNT] = {
 };
 static volatile int32_t lfox_live;      /* some track has a depth and a destination */
 static volatile int32_t lfox_dirty;     /* the state moved: the page lends again */
+static int32_t lfox_redraw;             /* a gesture moved the state: ask for a frame */
 
 /* The value index the tick needs for a track's DEST.  The mod's own list is
  * in page order (LFO1 and LFO2 first, then filter, amp and synth); the tick's
@@ -258,6 +260,15 @@ static uint8_t lfox_saved[LFOX_STORE_SIZE] __attribute__((aligned(4))) = {
     96, 5, 64, 0, 0, 0, 0, 64
 };
 
+/* What the project held when it was loaded, or made: the values [LFO] + [NO]
+ * puts back.  A stock page key + [NO] reloads that page from its saved state,
+ * and for LFOX the saved state is the project block, so this is a copy of it
+ * taken at the load.  A project saved during the session does not move it on:
+ * core copies the mod's live block at a save and has no save callback to tell
+ * the mod, so the reload is "since the project was loaded" (README, "What is
+ * not stock"). */
+static uint8_t lfox_baseline[4][C_COUNT] = LFOX_BASELINE_INIT;
+
 /* The settings RAM holds into the block (what a save copies). */
 static void lfox_block_put(int32_t track)
 {
@@ -301,6 +312,11 @@ static void lfox_loaded(int32_t found)
                 lfox_saved[t * C_COUNT + i] = s.v[i];
     }
     lfox_block_load();
+    /* This is the state [LFO] + [NO] reloads: the block as the project holds
+     * it now. */
+    for (t = 0; t < 4; t++)
+        for (i = 0; i < C_COUNT; i++)
+            lfox_baseline[t][i] = (uint8_t)lfox_ram[t][i];
     /* The kit the page lent LFO1's slots from may be gone with the project. */
     for (t = 0; t < 4; t++)
         lfox_forget_lend(t);
@@ -534,10 +550,15 @@ void lfox_audio(int16_t *words, uint32_t rate, uint32_t mask, uint32_t mask2,
  * lfox_audio gives the voices LFO1's own words for the block, and a key or
  * leaving the page gives the sound them back. */
 struct core_page lfox_page = {
-    /* "LFO", not "LFOX": the stock view heads a view's pages with the page's
-     * title and a count of the view's pages -- "LFO (3/3)" -- so the 3 belongs
-     * to that count, not to the name. */
-    27, 11, "LFO", "LFO",
+    /* A page record names a page twice.  Its title (+4) heads the screen with
+     * the view's page count -- "LFO (3/3)" -- so the title is plain "LFO" and
+     * the 3 belongs to that count, as on LFO1's and LFO2's pages.  Its short
+     * title (+0) is the name the gesture boxes print: the stock view formats
+     * them as "COPY PAGE %s" (0x40045820 pushes the record's first word) and
+     * "Randomize Page %s" (0x400436fe the same), which is why LFO1's copy
+     * reads "COPY PAGE LFO1".  With "LFO" there too the boxes read "COPY PAGE
+     * LFO", so the short title is "LFOX". */
+    27, 11, "LFOX", "LFO",
     { 49, 50, 51, 52, 53, 54, 55, 56 },
     9, 0, 0
 };
@@ -548,10 +569,12 @@ struct core_page lfox_page = {
 
 static void *lfox_brain;
 static int32_t lfox_shown;
-static int32_t lfox_press, lfox_opening;
+static int32_t lfox_press;
 static int32_t lfox_ptn;                /* PTN is held */
-static int32_t lfox_func;               /* FUNC is held: its hints are the
-                                         * page's own, not the strip's */
+static int32_t lfox_lfo_down;           /* LFO is held: a gesture's modifier */
+static int32_t lfox_lfo_hold;           /* a press this page took, waiting its release */
+static int32_t lfox_lfo_chord;          /* a second key arrived while it was held */
+static int32_t lfox_swallow_release;    /* its release must not step the page */
 static volatile int32_t lfox_lend_track = -1;   /* the track whose slots the page lends */
 static volatile int32_t lfox_lent;              /* 1 while the slots hold LFOX's values */
 static volatile int32_t lfox_patch_track = -1;  /* whose voices still need LFO1's words */
@@ -560,6 +583,55 @@ static int16_t lfox_shadow[LFOX_BORROW];/* LFOX's values, as the slots hold them
 static int32_t lfox_unlend_wait;        /* ticks left to put LFO1's words back */
 static uint8_t *lfox_kit_seen;          /* the kit the settings were read from */
 static int32_t lfox_track_seen = -1;
+
+/* The track sound's slots the lend does not own: slot 0 and 9-78 (LFO2's
+ * eight and every stock parameter).  Their contents are how the mod tells a
+ * knob turn on its own page -- which writes one of the eight lent slots and
+ * nothing else -- from anything else that writes the sound: a pattern reload,
+ * a sound load, a preset.  Those replace the whole sound, and their LFO1
+ * words are the sound's own, not an edit of LFOX's, so they must never be
+ * adopted (the unit's "after a pattern reload LFO1's settings show on LFOX and
+ * LFO1 is empty": the reload's words were adopted into LFOX and the stale
+ * lend was written back over LFO1). */
+#define LFOX_OUTER      71              /* slot 0, then slots 9-78 */
+static uint16_t lfox_outer[4][LFOX_OUTER];
+
+static void lfox_outer_take(int32_t t)
+{
+    int32_t i, k = 0;
+
+    lfox_outer[t][k++] = (uint16_t)FW_SOUND_SLOT(fw_kit, t, 0);
+    for (i = 9; i <= 78; i++)
+        lfox_outer[t][k++] = (uint16_t)FW_SOUND_SLOT(fw_kit, t, i);
+}
+
+static int32_t lfox_outer_same(int32_t t)
+{
+    int32_t i, k = 0;
+
+    if ((uint16_t)FW_SOUND_SLOT(fw_kit, t, 0) != lfox_outer[t][k++])
+        return 0;
+    for (i = 9; i <= 78; i++)
+        if ((uint16_t)FW_SOUND_SLOT(fw_kit, t, i) != lfox_outer[t][k++])
+            return 0;
+    return 1;
+}
+
+/* Are the eight lent slots still exactly what the page lent?  If something
+ * else has written them (a pattern reload puts LFO1's saved words there), the
+ * words kept here are no longer LFO1's and must not be written back. */
+static int32_t lfox_shadow_up(void)
+{
+    int32_t i;
+
+    if (lfox_lend_track < 0 || lfox_lend_track > 3)
+        return 0;
+    for (i = 0; i < LFOX_BORROW; i++)
+        if ((int16_t)FW_SOUND_SLOT(fw_kit, lfox_lend_track, LFOX_SLOT_SPD + i)
+            != lfox_shadow[i])
+            return 0;
+    return 1;
+}
 
 /* What the sound's slots hold while the page lends: LFOX's eight words as the
  * *engine* has them, not the whole-number copy the three free slots can pack.
@@ -594,11 +666,19 @@ static void lfox_lend(int32_t track)
 
     if (!fw_kit || track < 0 || track > 3)
         return;
-    if (lfox_lend_track != track) {
+    /* LFO1's words are taken afresh whenever the lend does not hold them:
+     * after a hand-back, and -- what an earlier build got wrong -- after
+     * anything else
+     * has written the sound while the page stayed up.  With the old test
+     * (another track only) a reload's LFO1 words were never seen and the
+     * previous sound's words were handed back over them, which is the unit's
+     * "LFO1 stays empty after a reload". */
+    if (!lfox_lent || lfox_lend_track != track) {
         lfox_give_back();
         for (i = 0; i < LFOX_BORROW; i++)
             lfox_keep[i] = (int16_t)FW_SOUND_SLOT(fw_kit, track, LFOX_SLOT_SPD + i);
         lfox_lend_track = track;
+        lfox_outer_take(track);
     }
     lfox_shadow_make(track);
     for (i = 0; i < LFOX_BORROW; i++)
@@ -690,6 +770,7 @@ static void lfox_forget_lend(int32_t track)
     lfox_lent = 0;
     lfox_lend_track = -1;
     lfox_patch_track = -1;
+    lfox_unlend_wait = 0;
 }
 
 static void lfox_give_back(void)
@@ -710,7 +791,7 @@ static void lfox_give_back(void)
  * and is bound to LFO1's and LFO2's records, so a mod page's two cells stay
  * empty -- the labels under two blank cells, which is what the page looked like
  * until now.  The mod draws the same display itself, to the stock page's own
- * pixels (measured off it):
+ * pixels (measured off the stock page):
  *
  *   `[` at x 25, one period over columns 32-60, `]` at x 67; rows 41-55 with
  *   the mid line at 48 and dots a quarter period apart; the phase square three
@@ -783,14 +864,59 @@ static void lfox_bracket(void *bmp, int32_t x, int32_t open)
  * clear takes the whole interior.
  *
  * Two things here are stock's and were measured off it
- * ("Stock LFO1's and LFO2's
- * strips"): the curve is the period that starts at `SPH` -- the shape is
+ * ("Stock LFO1's and LFO2's strips"): the curve is the period that starts at
+ * `SPH` -- the shape is
  * rotated, not merely marked -- and the hollow square is drawn only where that
  * start sample sits on the mid line, which is why stock shows it for TRI, SIN,
  * EXP and RMP at phase 0 and not for SQR, SAW or RND, nor at half a period. */
-static void lfox_strip(void *bmp, int32_t wave, int32_t phase, int32_t right)
+#define LFOX_PV_X0      24      /* the columns the strip paints in */
+#define LFOX_PV_X1      68
+#define LFOX_PV_W       (LFOX_PV_X1 - LFOX_PV_X0 + 1)
+
+static uint8_t lfox_under[LFOX_PV_W][8];
+
+/* `bmp` is a Bitmap object, not the frame: its first long is the class's
+ * vtable, and the pixels are behind a pointer in it.  An earlier build read
+ * `bmp` itself
+ * as if it were 8 bytes a column, so what it saved and OR'd back was the
+ * object's own words -- on the unit the strip stayed over the destination
+ * list's text, which is exactly what an overlay restore that writes nothing
+ * looks like.  The offset is measured, not guessed; 0 means no address this
+ * mod will touch. */
+#ifndef LFOX_BMP_PIXELS
+#define LFOX_BMP_PIXELS 0x10    /* the Bitmap's pixel bytes */
+#endif
+
+static uint8_t *lfox_pixels(void *bmp)
 {
-    int32_t c, col, idx, lo, hi, x, y;
+    uint8_t *p;
+
+    if (!bmp)
+        return 0;
+    p = *(uint8_t **)((char *)bmp + LFOX_BMP_PIXELS);
+    if ((uintptr_t)p < 0x40000000UL || (uintptr_t)p >= 0x60000000UL)
+        return 0;                   /* not a frame: leave the pen off the line */
+    return p;
+}
+
+/* Stock's destination list is a menu drawn over this page, and the page's own
+ * drawing runs after the frame is composed (the hook bus runs ev_draw after
+ * drawAll), so the curve would land on top of the panel's rows and
+ * show through its black background, where stock's own strip is behind them.
+ * The list is not a screen of its own -- the brain's bottom and top screens are
+ * the same object with it open and closed -- so the page follows the keys that
+ * open and close it, which are the only ways in and out: D opens it, turned or
+ * pushed, and D, YES or NO close it (the unit's report).  While it is up the
+ * strip keeps off its columns, so the panel stays whole.  Its first column is
+ * measured -- the highlighted row spans columns 51-122 on every page
+ * (the same on LFO1's and LFO2's pages with their lists open). */
+#define LFOX_LIST_X     51      /* the stock list panel's first column */
+static int32_t lfox_list_up;    /* and whether it is over the page now */
+
+static void lfox_strip(void *bmp, int32_t wave, int32_t phase)
+{
+    uint8_t *fb = lfox_pixels(bmp);
+    int32_t c, i, col, idx, lo, hi, x, y, clip;
 
     if (wave < 0 || wave > 6)
         wave = 0;
@@ -798,16 +924,29 @@ static void lfox_strip(void *bmp, int32_t wave, int32_t phase, int32_t right)
         phase = 0;
     if (phase > 127)
         phase = 127;
+    /* What the frame already holds in these columns -- the page's own art and
+     * a stock layer drawn over it -- is put back on top at the end, so a list
+     * or a menu composes over the strip the way it does on stock's page.  The
+     * white part comes back that way; a black panel background cannot, which is
+     * why the stock list's columns are left alone while it is up (lfox_list_up,
+     * above). */
+    if (fb)
+        for (c = 0; c < LFOX_PV_W; c++)
+            for (i = 0; i < 8; i++)
+                lfox_under[c][i] = fb[8 * (LFOX_PV_X0 + c) + i];
+    /* The stock list over the page: its columns are its own, so the clear, the
+     * brackets and the curve stop at its edge and the panel is left whole. */
+    clip = lfox_list_up ? LFOX_LIST_X : LFOX_PV_R + 1;
     fw_fillrect(bmp, LFOX_PV_L + 1, LFOX_PV_BOT - 1,
-                right < LFOX_PV_R - 1 ? right : LFOX_PV_R - 1,
+                (clip <= LFOX_PV_R) ? clip - 1 : LFOX_PV_R - 1,
                 LFOX_PV_TOP + 1, 0);
     lfox_bracket(bmp, LFOX_PV_L, 1);
-    if (right >= LFOX_PV_R)
+    if (LFOX_PV_R < clip)
         lfox_bracket(bmp, LFOX_PV_R, 0);
     /* the mid line's dots, a quarter period apart, before the curve so the
      * curve covers them where it passes: stock's own layering */
     for (c = 0; c < LFOX_PV_COLS; c += LFOX_PV_COLS / 4)
-        if (LFOX_PV_X + c <= right)
+        if (LFOX_PV_X + c < clip)
             fw_fillrect(bmp, LFOX_PV_X + c, LFOX_PV_MID, LFOX_PV_X + c, LFOX_PV_MID, 1);
     /* a column at a time, from the row the previous sample sat on to its own,
      * which is what makes a square wave's jump a vertical line.  The table is
@@ -815,8 +954,6 @@ static void lfox_strip(void *bmp, int32_t wave, int32_t phase, int32_t right)
      * `SPH` points at, and the period runs from there, as stock's does. */
     col = (phase * (LFOX_PV_COLS - 1) + 64) / 127;
     for (c = 0; c < LFOX_PV_COLS; c++) {
-        if (LFOX_PV_X + c > right)
-            break;
         idx = (c + col) % (LFOX_PV_COLS - 1);
         lo = lfox_lo[wave][idx];
         hi = lfox_hi[wave][idx];
@@ -825,8 +962,9 @@ static void lfox_strip(void *bmp, int32_t wave, int32_t phase, int32_t right)
             lo = hi;
             hi = y;
         }
-        fw_fillrect(bmp, LFOX_PV_X + c, LFOX_PV_MID - hi,
-                    LFOX_PV_X + c, LFOX_PV_MID - lo, 1);
+        if (LFOX_PV_X + c < clip)
+            fw_fillrect(bmp, LFOX_PV_X + c, LFOX_PV_MID - hi,
+                        LFOX_PV_X + c, LFOX_PV_MID - lo, 1);
     }
     /* The period's start, as stock marks it: a hollow square at the curve's
      * first column, on the mid line, drawn only where the sample the period
@@ -834,69 +972,40 @@ static void lfox_strip(void *bmp, int32_t wave, int32_t phase, int32_t right)
      * and RMP at phase 0, not for SQR, SAW or RND (their first column is a
      * jump), and not at half a period; measured for every waveform at phase 0,
      * 32, 64 and 96. */
-    if (wave == 6 || (lfox_lo[wave][col] != 0 && lfox_hi[wave][col] != 0))
-        return;
-    x = LFOX_PV_X;
-    y = LFOX_PV_MID;
-    fw_fillrect(bmp, x, y, x, y, 0);             /* the hole, over the curve */
-    fw_fillrect(bmp, x - 1, y - 1, x + 1, y - 1, 1);
-    fw_fillrect(bmp, x - 1, y + 1, x + 1, y + 1, 1);
-    fw_fillrect(bmp, x - 1, y, x - 1, y, 1);
-    fw_fillrect(bmp, x + 1, y, x + 1, y, 1);
+    if (wave != 6 && (lfox_lo[wave][col] == 0 || lfox_hi[wave][col] == 0) &&
+        LFOX_PV_X < clip) {
+        x = LFOX_PV_X;
+        y = LFOX_PV_MID;
+        fw_fillrect(bmp, x, y, x, y, 0);         /* the hole, over the curve */
+        fw_fillrect(bmp, x - 1, y - 1, x + 1, y - 1, 1);
+        fw_fillrect(bmp, x - 1, y + 1, x + 1, y + 1, 1);
+        fw_fillrect(bmp, x - 1, y, x - 1, y, 1);
+        fw_fillrect(bmp, x + 1, y, x + 1, y, 1);
+    }
+    if (fb)
+        for (c = 0; c < LFOX_PV_W; c++)
+            for (i = 0; i < 8; i++)
+                fb[8 * (LFOX_PV_X0 + c) + i] |= lfox_under[c][i];
 }
-
-/* Is a stock layer over the page -- the destination list, a menu, a dialog?
- *
- * core_page_shown says no for the destination list, because the list is not
- * another screen in the dispatcher's sense: it is a layer pushed on this
- * screen's stack.  The brain's +0x58 is the top layer, and the page's own is
- * the bottom of that stack -- the one whose +4 points at itself minus 0x10
- * (the stack's header sits there).  Measured on the unit's build for the
- * destination list on both stock's LFO page and the mod's (00x41c185a0 plain,
- * below 0x41c18590; a list open, a new top whose below is 0x41c185a0), see
- * Anything that cannot be read as that stack -- a
- * field this OS does not keep, memory that is not RAM -- is taken as "nothing
- * over the page": the strip is then drawn as before, and a field this code
- * reads wrong can only cost the fix, never the page.
- *
- * This is *not* the same question as "may the strip be drawn": stock draws
- * the strip as part of the page and the overlays land on it, so both the
- * destination list and FUNC's hints leave it visible (measured on stock's
- * page: with FUNC held and with the list open the strip's own pixels are
- * unchanged).  The mod draws after all of them, so it
- * takes the columns that are free instead: the list's own text starts at
- * column 52, and FUNC's hints stay out of the strip's box altogether. */
-static int32_t lfox_covered(void)
-{
-    uintptr_t brain = (uintptr_t)lfox_brain;
-    uintptr_t layer, below;
-
-    if (!brain)
-        return 0;
-    layer = *(volatile uint32_t *)(brain + 0x58);
-    if (layer < 0x40000000UL || layer >= 0x49000000UL)
-        return 0;
-    below = *(volatile uint32_t *)(layer + 4);
-    if (below < 0x40000000UL || below >= 0x49000000UL)
-        return 0;
-    return below != layer - 0x10;
-}
-
-/* The last column the strip may paint in this frame.  With nothing over the
- * page the whole strip; under the destination list only up to the column the
- * list's text begins at -- the left bracket, the mid line's dots and the left
- * half of the curve stay, where 1.12 dropped the lot.  FUNC's hints are drawn
- * outside the strip's box, so they clip nothing: with FUNC held the strip is
- * whole, as stock's is. */
-#define LFOX_PV_FREE   LFOX_PV_R
-#define LFOX_PV_LIST   51
 
 /* After each frame the stock view has drawn: the page is ours, so its display
- * is drawn again.  Gated on firmware state (the page being the one shown, and
- * what is over it), never on pixels. */
+ * is drawn again, whole.  Gated on firmware state (the page being the one
+ * shown), never on pixels.  A stock layer over the page is not a reason to
+ * clip: the strip keeps what the frame already holds and puts it back on top
+ * (lfox_strip), so the destination list is composed over a whole strip, the
+ * way stock composes it. */
+/* The destination list is a stock menu drawn over the page, and the mod draws
+ * after it.  Stock draws its strip first and its list over it, so its strip is
+ * behind the rows; the mod does the same, by composition rather than by
+ * staying away: lfox_strip saves what the frame holds where the strip goes and
+ * puts it back on top of the curve, so whatever stock drew there last -- the
+ * page's own art, or the list's rows and text -- is on top.  An earlier build
+ * skipped the strip while the list was up, which left the WAVE and SPH cells
+ * empty and did not look like LFO1's and LFO2's pages (the unit's report).
+ * Gated on firmware state only: the page being the one shown. */
 void lfox_draw(void *bmp, void *ctrl)
 {
-    int32_t t, right;
+    int32_t t;
 
     (void)ctrl;
     if (!lfox_brain || !core_page_shown(lfox_brain, &lfox_page))
@@ -904,8 +1013,7 @@ void lfox_draw(void *bmp, void *ctrl)
     t = fw_active_track;
     if (t < 0 || t > 3)
         return;
-    right = (lfox_covered() && !lfox_func) ? LFOX_PV_LIST : LFOX_PV_FREE;
-    lfox_strip(bmp, lfox_ram[t][C_WAVE], lfox_ram[t][C_SPH], right);
+    lfox_strip(bmp, lfox_ram[t][C_WAVE], lfox_ram[t][C_SPH]);
 }
 
 /* ---- the UI task -------------------------------------------------------------------------- */
@@ -913,8 +1021,10 @@ void lfox_draw(void *bmp, void *ctrl)
 /* Is the page up, with a stock menu or list over it or without?
  *
  * core_page_shown answers the stricter question -- its own comment says "with
- * no overlay over it" -- and that is what the drawing wants: over a stock list
- * the mod must not paint.  The settings want the looser one.  DEST's turn now
+ * no overlay over it" -- and the drawing follows it, because a list is a
+ * separate screen in the pager's sense; the settings want the looser one.
+ * (The strip draws under whatever the list puts on the frame regardless: it
+ * saves and restores the pixels it covers.)  DEST's turn
  * belongs to the stock view (below) and the destination list it opens is a
  * modal: while that list is up the page is still the bottom screen's, and the
  * choice it confirms goes into the sound's DEST slot, where lfox_adopt reads
@@ -924,22 +1034,31 @@ void lfox_draw(void *bmp, void *ctrl)
  * long.  So the lend and the adopt follow core_page_shown's own checks -- the
  * page manager's view, and the page's place in that view's list -- without the
  * one for a screen on top (core-dn1's mods/core-dn1/pages.s). */
-static int32_t lfox_page_up(void *brain)
+/* The page the LFO view is showing: 0 LFO1's, 1 LFO2's, 2 this one (measured
+ * on the stock build), or -1 when the view is not up at all.  The
+ * view keeps the page's place in its list at +144, and this page's is its
+ * pos. */
+static int32_t lfox_view_page(void *brain)
 {
     void *screen, *mgr, *view;
 
     if (!brain || !lfox_page.view)
-        return 0;
+        return -1;
     screen = *(void **)((char *)brain + 0x54);   /* the pages' screen */
     if (!screen)
-        return 0;
+        return -1;
     mgr = *(void **)((char *)screen + 8);        /* its page manager */
     if (!mgr)
-        return 0;
+        return -1;
     view = *(void **)((char *)mgr + 0xc0);       /* the view it shows */
     if (view != lfox_page.view)
-        return 0;
-    return *(int32_t *)((char *)view + 144) == lfox_page.pos;
+        return -1;
+    return *(int32_t *)((char *)view + 144);
+}
+
+static int32_t lfox_page_up(void *brain)
+{
+    return lfox_view_page(brain) == (int32_t)lfox_page.pos;
 }
 
 /* All eight knobs are the stock UI's, DEST included.  Their ids are LFO1's and
@@ -1000,17 +1119,99 @@ static int32_t lfox_adopt(int32_t t)
     slot = lfox_dest_value(t);
     lfox_eng[t][C_DEST] = (int16_t)((slot < 0) ? 0xFF00 : (slot << 8));
     lfox_live_update();
-    lfox_save(t);
+    /* The block follows, but not lfox_save's dirty flag: the page already shows
+     * these words (the knob or the gesture wrote the slots), so a re-lend here
+     * only wrote them back over a knob turned between the two ticks. */
+    lfox_block_put(t);
     return 1;
 }
+
+/* ---- the stock page's key gestures -------------------------------------------------------- */
+
+/* A stock LFO page answers the page key's own gestures, and they act on the
+ * page's eight values: [LFO] + [YES] randomises them, [LFO] + [NO] reloads
+ * them from the saved state, [LFO] + [PLAY] clears them (the defaults back),
+ * [LFO] + [RECORD] copies them and [LFO] + [STOP] pastes them (OS 1.44
+ * manual, section 17 and 11.11; measured on the stock build: randomise moves
+ * all eight fields,
+ * +PLAY leaves exactly 96/5/64/0/0/0/0/64, and a copy/paste round-trips a
+ * turn).  The stock view draws its popup for each -- "COPY PAGE LFO",
+ * "CLEAR PAGE LFO", "PASTE PAGE LFO".
+ *
+ * The page-level three -- copy, clear and paste -- are the mod's to answer,
+ * because stock's handler refuses page 2: measured,
+ * a copy there leaves LFO1's own paste alone and
+ * a paste there leaves LFOX untouched, while the same chords work on pages 0
+ * and 1.  So the mod keeps the words itself, and the key still goes to stock
+ * untouched: stock draws the popup over the page, and this handler has already
+ * taken or written the words (lfox_page_copy, lfox_page_words).  The alternative
+ * -- taking the chord -- silences that popup, which the unit reported missing.
+ *
+ * A copy made on LFO1's or LFO2's page is mirrored too: the same eight words,
+ * read out of the sound while the stock page still has them there (the chord
+ * arrives before stock's handler runs), so LFO1 -> LFOX and LFO2 -> LFOX
+ * paste.
+ *
+ * Why the mod keeps the words at all, and what it does with them (measured in
+ * the emulator on the stock 1.44 image): stock's copy
+ * does run on page 2 and writes the same clipboard a stock page writes -- the
+ * eight (parameter id, value) pairs, LFO1's ids and the words the page lends --
+ * but stock's *paste* refuses a clip whose page is neither the page it is
+ * pasted on nor that page's LFO sibling (10 <-> 11).  That comparison is
+ * inside the paste routine (0x4002bf48) and it refuses page 2 both ways, which
+ * is why a clip from LFO1 cannot reach LFOX by stock's own path and an LFOX
+ * clip cannot reach LFO1.  So the mod keeps the eight words of the last copy
+ * on any of the three pages, and when a paste's target is not the page the
+ * clip came from it writes them into that target page's own eight slots -- the
+ * path a knob's edit takes, so the voices and the boxes follow.  A clip stock
+ * can paste itself (the same page, or LFO1 <-> LFO2) is left entirely to
+ * stock.  Stock draws no popup for a paste it refuses, so a cross-page paste
+ * lands without one (README, "What is not stock"). */
+
+/* The stock key dispatcher, the routine core_page_open uses to press a page
+ * key.  A plain tap on this page has to step the view like the panel key does,
+ * and since the press is taken here (so that a chord cannot step it), the tap
+ * is given to the dispatcher as a press and a release of LFO. */
+#define LFOX_KEYDISP 0x40016FC0
+#define LFOX_EV_MAGIC 0x4C464F33UL          /* "LFOX": the page's own event */
+
+static int32_t lfox_step_ev[8];
+
+static void lfox_step_view(void *brain, void *event)
+{
+    int32_t i;
+
+    if (!brain || !event)
+        return;
+    for (i = 0; i < 8; i++)
+        lfox_step_ev[i] = ((int32_t *)event)[i];
+    lfox_step_ev[3] = 25;                       /* LFO */
+    /* The mark travels in the event: the dispatcher may queue it for the UI
+     * task, and a flag set around these calls was gone by the time such an
+     * event was delivered.  Its press then stayed down in this handler, and
+     * the next YES in the destination list read as [LFO] + [YES] and
+     * randomised the whole page -- the unit's "YES picks a random parameter". */
+    lfox_step_ev[5] = (int32_t)LFOX_EV_MAGIC;
+    lfox_step_ev[4] = 1;                        /* pressed */
+    ((void (*)(void *, void *))LFOX_KEYDISP)(brain, lfox_step_ev);
+    lfox_step_ev[4] = 0x10;                     /* released */
+    ((void (*)(void *, void *))LFOX_KEYDISP)(brain, lfox_step_ev);
+}
+
 
 void lfox_tick(void *ctrl)
 {
     int32_t shown, t;
 
-    (void)ctrl;
     if (!lfox_brain)
         return;
+    /* A gesture wrote the page's values itself; the stock view paints them on
+     * the frame it is asked for, the way a knob turn asks for one. */
+    if (lfox_redraw) {
+        if (ctrl)
+            *((uint8_t *)ctrl + 0x20) = 1;
+        lfox_redraw = 0;
+    }
     /* The settings follow the project, not the sound: only the lend needs the
      * kit, and a kit, sound or project load takes that sound's LFO1 words with
      * it, so the lend is forgotten for the sound that is there now. */
@@ -1029,8 +1230,17 @@ void lfox_tick(void *ctrl)
         /* The hand-back again, a few ticks on: the firmware writes the page's
          * own eight values to the sound as it closes, and that copy has to be
          * overwritten before LFO1 runs on it.  Once lend_track is -1 the sound
-         * is not ours any more, so this waits its ticks first. */
+         * is not ours any more, so this waits its ticks first.
+         *
+         * Only while the words kept here are still the sound's: a pattern
+         * reload or a sound load in those ticks replaces LFO1's words, and
+         * writing the old ones after it is what left LFO1 empty. */
         if (lfox_unlend_wait > 0 && lfox_lend_track >= 0) {
+            if (!lfox_outer_same(lfox_lend_track) || !lfox_shadow_up()) {
+                lfox_forget_lend(lfox_lend_track);
+                lfox_dirty = 1;
+                return;
+            }
             lfox_put_back(lfox_lend_track);
             lfox_unlend_wait--;
             return;
@@ -1045,6 +1255,14 @@ void lfox_tick(void *ctrl)
         lfox_lend(t);
         return;
     }
+    if (!lfox_outer_same(t)) {
+        /* The sound changed under the lend: a pattern reload, a sound load or
+         * a preset replaced it.  Its LFO1 words are the new sound's, so the
+         * lend starts again from them instead of reading them as LFOX edits. */
+        lfox_forget_lend(t);
+        lfox_dirty = 1;
+        return;
+    }
     if (lfox_dirty) {                   /* a load or a set: the boxes follow */
         lfox_dirty = 0;
         lfox_lend(t);
@@ -1053,22 +1271,267 @@ void lfox_tick(void *ctrl)
     lfox_adopt(t);
 }
 
+/* An encoder turn or push over the page.  Nothing is answered here -- the
+ * stock knob path has it -- but the hook keeps the brain the page belongs to,
+ * so a frame can be drawn even when the draw callback comes first. */
+int32_t lfox_enc(void *brain, void *event)
+{
+    int32_t *ev = (int32_t *)event;
+
+    lfox_brain = brain;
+    /* D, the destination knob (encoder 4, ev+12): a turn opens the stock list
+     * over the page, and scrolls it while it is up. */
+    if (ev && ev[3] == 4 && lfox_page_up(brain))
+        lfox_list_up = 1;
+    return 0;
+}
+
+/* ---- the page's copy, clear and paste ----------------------------------------------------- */
+
+/* The words a stock copy would take, and that a stock paste would write: the
+ * page's eight parameter values, in the units the knobs step in (SPD moves
+ * 0x20 of an 8.8 word, so a whole number would lose seven of eight steps).
+ * While the page is up they are where the lend put them, in the sound's own
+ * slots; if it is not lent yet, the engine's copy is the same value.
+ *
+ * DEST is the one value that is not the setting itself: the lent slot holds
+ * the slot the engine adds to (what the page names), and lfox_adopt turns it
+ * back into this list's entry, so a pasted DEST goes through the same path a
+ * knob's does. */
+static int16_t lfox_clip[C_COUNT];
+static int32_t lfox_clip_ok;
+static int32_t lfox_clip_page;          /* the page it came from: 0, 1, or 2 for LFOX's */
+
+static void lfox_page_take(int16_t *w);
+
+static void lfox_page_copy(void)
+{
+    lfox_page_take(lfox_clip);
+    lfox_clip_ok = 1;
+    lfox_clip_page = 2;
+}
+
+/* A copy made on LFO1's or LFO2's page, mirrored: the same eight words, read
+ * out of the sound while the stock page still has them there (the copy chord
+ * arrives before stock's handler runs).  LFO1's eight are slots 1-8, LFO2's
+ * 9-16. */
+static void lfox_stock_copy(int32_t page)
+{
+    int32_t t = fw_active_track, i, base = (page == 0) ? 1 : 9;
+
+    if (!fw_kit || t < 0 || t > 3)
+        return;
+    for (i = 0; i < C_COUNT; i++)
+        lfox_clip[i] = (int16_t)FW_SOUND_SLOT(fw_kit, t, base + i);
+    lfox_clip_ok = 1;
+    lfox_clip_page = page;
+}
+
+/* The page's eight words as they stand: what a copy takes and a clear keeps. */
+static void lfox_page_take(int16_t *w)
+{
+    int32_t t = fw_active_track, i;
+
+    if (!fw_kit || t < 0 || t > 3)
+        return;
+    for (i = 0; i < C_COUNT; i++) {
+        if (lfox_lent && lfox_lend_track == t)
+            w[i] = (int16_t)FW_SOUND_SLOT(fw_kit, t, LFOX_SLOT_SPD + i);
+        else
+            w[i] = lfox_eng[t][i];
+    }
+}
+
+/* The eight words into this page: the sound's slots while the page lends them,
+ * where the tick's adopt picks them up exactly as it picks up a knob turn, or
+ * the settings directly when it does not (a chord before the first lend). */
+static void lfox_page_words(const int16_t *w)
+{
+    int32_t t = fw_active_track, i, v;
+    struct lfox_state s;
+
+    if (!fw_kit || t < 0 || t > 3)
+        return;
+    if (lfox_lent && lfox_lend_track == t) {
+        for (i = 0; i < C_COUNT; i++)
+            FW_SOUND_SLOT(fw_kit, t, LFOX_SLOT_SPD + i) = w[i];
+    } else {
+        lfox_ram_get(t, &s);
+        for (i = 0; i < C_COUNT; i++) {
+            v = (int32_t)((uint16_t)w[i] >> 8);
+            if (i == C_DEST)
+                s.v[i] = (uint8_t)lfox_dest_entry(v);
+            else
+                s.v[i] = (uint8_t)(v > lfox_max[i] ? lfox_max[i] : v);
+        }
+        lfox_ram_set(t, &s);
+        lfox_save(t);
+        lfox_dirty = 1;
+    }
+    lfox_redraw = 1;                    /* the boxes show the new words */
+}
+
+/* The words onto a stock LFO page: its own eight slots, in the page's field
+ * order (SPD MULT FADE DEST WAVE SPH MODE DEP), which is LFOX's as well, and
+ * DEST in the slots' own terms (the destination value the page names).  Stock's
+ * paste would write the same eight slots; it refuses this clip because its page
+ * is not this page (`lfox.c`'s gesture note), so the mod writes them the way a
+ * knob's edit goes in -- core_sound_set, the stock edit's path to the voices --
+ * and the boxes read the slots back. */
+static void lfox_stock_paste(int32_t page, const int16_t *w)
+{
+    int32_t t = fw_active_track, i, base = (page == 0) ? 1 : 9;
+
+    if (!fw_kit || t < 0 || t > 3)
+        return;
+    for (i = 0; i < C_COUNT; i++)
+        core_sound_set(t, base + i, w[i]);
+    /* A hand-back still waiting would put LFO1's own words over these. */
+    lfox_unlend_wait = 0;
+    lfox_redraw = 1;                    /* the boxes show the pasted words */
+}
+
+
 int32_t lfox_key(void *brain, void *event)
 {
     int32_t *ev = (int32_t *)event;
     int32_t code = ev[3];
     int32_t flags = ev[4];
+    int32_t press = (flags & 1) && !(flags & 8);
 
     lfox_brain = brain;
-    if (code == 1)                      /* FUNC: its hints leave the strip slot
-                                         * alone, so the strip stays whole */
-        lfox_func = (flags & 1) != 0;
     if (code == 4)                      /* PTN */
         lfox_ptn = (flags & 1) != 0;
+    if (code == 25) {                   /* LFO is a gesture's modifier too */
+        if (flags & 0x10)
+            lfox_lfo_down = 0;
+        else if (flags & 1)
+            lfox_lfo_down = 1;
+    }
+
+    /* Stock's destination list over this page: D opens and closes it (a push;
+     * a turn is lfox_enc's), and YES or NO confirm it and close it.  Those are
+     * the only ways in and out, so the page follows them and the strip keeps
+     * off the panel while it is up (lfox_strip).  D is Digitone UI id 49,
+     * YES 13 and NO 14.
+     *
+     * The push is followed on its *release*, not its press: stock's keys act on
+     * the release (its own page step does), and a push that is held down and
+     * then let go closes the list the same way a short one does -- so toggling
+     * on the press left the page thinking the list was still up after a hold,
+     * and the preview stayed cut at the panel's edge with the list gone (the
+     * unit's report).  A press that is not a tap carries its own flags, which is
+     * why the press edge could not be counted on either. */
+    if (!lfox_page_up(brain))
+        lfox_list_up = 0;
+    else if (code == 49 && (flags & 0x10))
+        lfox_list_up = !lfox_list_up;
+    else if (code == 13 || code == 14)
+        lfox_list_up = 0;           /* YES and NO confirm it and close it */
+
+    /* A key pressed while the LFO key is held makes that press a chord's
+     * modifier, and stock's view does not step the page for one (measured:
+     * [LFO] + [RECORD] on stock's LFO1 page copies LFO1's values and leaves
+     * the page where it was).  It must not count towards the three presses
+     * that open LFOX either, or three copies in a row would jump the page. */
+    if (press && code != 25 && lfox_lfo_down) {
+        lfox_press = 0;
+        lfox_lfo_chord = 1;             /* this press is a chord's modifier */
+        /* The copy and the paste are the mod's where stock cannot do them, and
+         * stock's own everywhere else; the key still goes through, so the
+         * popup stock draws for the chord is its own. */
+        if (code == 10) {               /* RECORD: copy */
+            if (lfox_page_up(brain))
+                lfox_page_copy();
+            else if (lfox_view_page(brain) == 0 || lfox_view_page(brain) == 1)
+                lfox_stock_copy(lfox_view_page(brain));
+        } else if (code == 12) {        /* STOP: paste */
+            int32_t target = lfox_page_up(brain) ? 2 : lfox_view_page(brain);
+
+            if (lfox_clip_ok && lfox_clip_page != target) {
+                if (target == 2)
+                    lfox_page_words(lfox_clip);
+                else if (target == 0 || target == 1)
+                    lfox_stock_paste(target, lfox_clip);
+            }
+        }
+    }
+
+    /* The page's chords are the stock ones, and every one of them still goes
+     * to the stock handler, which draws the popup it draws on LFO1 and LFO2
+     * ("COPY PAGE ...", "CLEAR PAGE ...", "PASTE PAGE ..."); taking them here
+     * silenced that popup, which the unit reported as missing on LFOX.  [LFO] +
+     * [YES], [LFO] + [NO] and [LFO] + [PLAY] (clear, and its second press's
+     * undo) act on the lent slots through the stock path and are stock's own:
+     * measured on the unit, its clear and undo reach page 2 too, and the mod
+     * writing them first only gave stock the defaults to undo to.  Copy takes
+     * LFOX's words and paste writes them (lfox_page_copy, lfox_page_words),
+     * because stock's clipboard refuses page 2; the lend is up while the page
+     * is, so stock edits LFOX's words and the next tick adopts them. */
+
+    /* The tap this page sends itself (lfox_step_view) comes back through this
+     * handler -- possibly from a queue, later than the call that sent it --
+     * and must reach the stock handler only: none of the bookkeeping below
+     * applies to it.  It carries its mark, so it is recognised however late it
+     * is delivered. */
+    if (((int32_t *)event)[5] == (int32_t)LFOX_EV_MAGIC)
+        return 0;
+
+    if (code == 25 && (flags & 0x10) && lfox_swallow_release) {
+        lfox_swallow_release = 0;
+        lfox_press = 0;
+        return 1;                           /* the gesture's press, not a page step */
+    }
+
+    /* On this page the LFO key is the gestures' modifier, and stock's pager
+     * must not step the view for it.  Left to stock, the step depended on the
+     * page the press came from: measured on the unit, [LFO] + [STOP] on
+     * `LFO (3/3)` sometimes stepped to (1/3) -- whose boxes then showed the
+     * lent values, so the paste looked as if it had worked on the wrong page.
+     * So every press is taken here.  A press with no other key while it is
+     * held, the plain tap that cycles the view, is handed to stock on release,
+     * so the cycle still works. */
+    if (code == 25 && lfox_page_up(brain)) {
+        if (flags & 1) {
+            if (!(flags & 8)) {
+                lfox_lfo_hold = 1;
+                lfox_lfo_chord = 0;
+            }
+            return 1;
+        }
+        if (flags & 0x10) {
+            /* The press that brought this page up was stock's (the page was
+             * not up when it arrived, so the page did not take it), and stock
+             * steps the view on *release*: let that release through and the
+             * page it just showed is left again in the same tap, which on the
+             * unit put every gesture on LFO (1/3).  So a release whose press
+             * this page did not take is swallowed. */
+            if (!lfox_lfo_hold)
+                return 1;
+            lfox_lfo_hold = 0;
+            lfox_press = 0;
+            if (lfox_lfo_chord)
+                return 1;                   /* the chord's own release */
+            lfox_step_view(brain, event);   /* a plain tap steps the view */
+            return 1;
+        }
+        return 0;
+    }
+
     /* A save, a pattern change or a menu key can copy the kit while it runs:
      * LFO1's own words are in the slots for those (flags bit 1 is FUNC held).
-     * The keys that only play or page along leave the lent values alone. */
-    if (!((code >= 26 && code <= 45) && !(flags & 2) && !lfox_ptn))
+     * The keys that only play or page along leave the lent values alone.
+     *
+     * The page's own copy, paste and clear are the exception: they are the
+     * LFO key's -- [LFO] + [RECORD], [LFO] + [STOP], [LFO] + [PLAY] -- and
+     * they act on the eight slots the lend fills.  So the lend has to still be up when the
+     * stock handler reads (a copy) or writes (a paste, a clear) them: the LFO
+     * key itself, and any key pressed while it is held, are the page's, not a
+     * save or a pattern change.  Handing LFO1 its words back on the LFO press
+     * gave a copy LFO1's settings and overwrote a paste before the tick could
+     * adopt it, which is the unit's "copy and paste does not work". */
+    if (!(lfox_page_up(brain) && (code == 25 || lfox_lfo_down))
+        && !((code >= 26 && code <= 45) && !(flags & 2) && !lfox_ptn))
         lfox_give_back();
 
     /* A knob push on this page is the stock UI's too: it writes the stock
@@ -1078,19 +1541,16 @@ int32_t lfox_key(void *brain, void *event)
             lfox_press = 0;
         return 0;
     }
-    if (lfox_opening)
-        return 1;                       /* a press core_page_open sent */
     if (!(flags & 1) || (flags & 8))
         return 0;
 
-    if (++lfox_press < 3)
-        return 0;                       /* let stock show LFO1, then LFO2 */
-
-    lfox_opening = 1;
-    (void)core_page_open(brain, event, 25, &lfox_page);
-    lfox_opening = 0;
-    lfox_press = 0;
-    lfox_shown = core_page_shown(brain, &lfox_page);
-    return 1;                           /* the third press is ours */
+    /* Nothing left to do for the key off this page: the core puts the page in
+     * the view's own list (`after` = LFO2), so stock's pager opens LFO1, steps
+     * to LFO2 and steps to this page on its own.  Measured on the unit with
+     * core-dn1 4.0 (view+144, read over USB): from LFO2 one tap is this page.
+     * The three-press counter an earlier build kept here opened the page a
+     * second time on
+     * top of that and overshot it -- three taps landed on LFO (1/3) again. */
+    return 0;
 }
 

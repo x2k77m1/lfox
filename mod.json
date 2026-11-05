@@ -1,9 +1,9 @@
 {
- "id": "lfox", "version": "1.0b",
+ "id": "lfox", "version": "1.0c",
  "license": "GPL-2.0-or-later",
  "title": "LFOX (Digitone mk1)",
  "category": "Modulation", "author": "x2k",
- "description": "A third LFO on the Digitone mk1: the LFO key cycles LFO1, LFO2, LFOX. LFOX has the stock LFO page's eight controls -- SPD, MULT, FADE, DEST, WAVE, SPH, MODE and DEP -- on its own page, computed by the firmware's own LFO engine: the stock routine at 0x400FED62 runs a second time each block with LFOX's settings and state, so its rate, waveforms, fade and trigger modes are the stock ones, per voice. DEST opens the stock destination list, as on LFO1 and LFO2. Its eight settings are saved with the project (not with the sound), and its modulation reaches the parameters a machine mod reads itself -- machines-dn1's knobs, SAY IT's PIT/SPD/THRT/MOUT -- as well as the stock ones, because it is added to the voice's own parameter word as well as to the block. Builds beside machines and digitables: it claims no sound slot. Needs core-dn1 4.0.",
+ "description": "A third LFO on the Digitone mk1: the LFO key cycles LFO1, LFO2, LFOX. LFOX has the stock LFO page's eight controls -- SPD, MULT, FADE, DEST, WAVE, SPH, MODE and DEP -- on its own page, computed by the firmware's own LFO engine: the stock routine at 0x400FED62 runs a second time each block with LFOX's settings and state, so its rate, waveforms, fade and trigger modes are the stock ones, per voice. DEST opens the stock destination list, as on LFO1 and LFO2. Its eight settings are saved with the project (not with the sound), and its modulation reaches the parameters a machine mod reads itself -- machines-dn1's knobs, SAY IT's PIT/SPD/THRT/MOUT -- as well as the stock ones, because it is added to the voice's own parameter word as well as to the block. The page takes the stock page's gestures -- [LFO] with YES, NO, PLAY, RECORD and STOP randomise, reload, clear, copy and paste -- and a copy travels between LFOX's page and LFO1's or LFO2's, with stock's own popups except on a paste that crosses pages. Builds beside machines and digitables: it claims no sound slot. Needs core-dn1 4.0.",
  "device": "digitone-mk1", "os": "1.44",
  "sources": ["lfox.c"],
  "sites": [
@@ -18,6 +18,7 @@
  "subscribe": [
   {"event": "ev_tick", "fn": "lfox_tick", "order": 50},
   {"event": "ev_key", "fn": "lfox_key", "order": 50},
+  {"event": "ev_enc", "fn": "lfox_enc", "order": 50},
   {"event": "ev_draw", "fn": "lfox_draw", "order": 60}
  ],
  "resources": {
